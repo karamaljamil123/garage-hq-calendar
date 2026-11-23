@@ -1,0 +1,5 @@
+# Day Trader skill pack working files: plans, orders, portfolio, logs. Keep them out of a public repository.
+trader/
+
+__pycache__/
+*.pyc

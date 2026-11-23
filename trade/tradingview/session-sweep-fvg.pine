@@ -1,0 +1,634 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// Session Sweep + FVG                          Built for the 1-minute chart.
+//
+// The rule, as it was described:
+//   1. Mark the high and the low of the Asia session and of the London session.
+//   2. Wait for price to sweep one of them (trade through it).
+//   3. On the 1-minute chart, take a fair value gap reversal the other way:
+//      a bullish reaction after a low is swept is a buy, a bearish reaction
+//      after a high is swept is a sell.
+//   4. The stop goes at the swing the sweep made. The target is 1:2 or the next
+//      pool of liquidity.
+//
+// How this script turns that into exact rules:
+//   - Sweep: a candle trades at least one tick beyond a finished session's
+//     high or low. Each level is used once.
+//   - Fair value gap (FVG): three candles where the third candle's low is above
+//     the first candle's high (bullish), or its high is below the first
+//     candle's low (bearish).
+//   - Structure shift: a close beyond the last swing high (after a low was
+//     swept) or the last swing low (after a high was swept).
+//   - Entry: at the close of the candle that completes the trigger you choose
+//     under "Entry trigger". It must come soon after the sweep.
+//   - Stop: one tick beyond the sweep's extreme. Target: 2R, or the next
+//     unswept session high / low.
+//
+// Everything is decided on closed candles, so nothing repaints.
+// This is a tool for testing a rule. It is not financial advice.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("Session Sweep + FVG", shorttitle = "Sweep FVG", overlay = true,
+     initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1,
+     pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false,
+     margin_long = 0, margin_short = 0,
+     max_labels_count = 500, max_boxes_count = 300)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+string GRP_TIME = "Time"
+string GRP_RULE = "Entry rules"
+string GRP_RISK = "Stop and target"
+string GRP_SIZE = "Order size (Strategy Tester only)"
+string GRP_VIEW = "Display and alerts"
+
+string MODEL_MSS  = "FVG after a structure shift"
+string MODEL_FVG  = "First FVG after the sweep"
+string MODEL_IFVG = "Inverse FVG"
+string MODEL_BOTH = "FVG after a structure shift, or inverse FVG"
+string TGT_RR     = "Fixed reward:risk"
+string TGT_LIQ    = "Next liquidity level"
+
+string tzInput    = input.string("America/New_York", "Time zone", group = GRP_TIME,
+     tooltip = "All times below are read in this time zone. America/New_York follows US daylight saving time automatically.")
+string asiaSess   = input.session("2000-0000", "Asia session", group = GRP_TIME,
+     tooltip = "Candles that open inside this window build the Asia high and low. The trading day starts when this session starts. Another common choice is 18:00-00:00.")
+string londonSess = input.session("0200-0500", "London session", group = GRP_TIME,
+     tooltip = "Candles that open inside this window build the London high and low. Another common choice is 03:00-08:00.")
+string entrySess  = input.session("0930-1100", "Entry window", group = GRP_TIME,
+     tooltip = "Entries are only taken on candles that open inside this window. A sweep may happen before it.")
+bool   useFlat    = input.bool(true, "Close any open trade at", group = GRP_TIME, inline = "flat")
+int    flatHour   = input.int(15, "", minval = 0, maxval = 23, group = GRP_TIME, inline = "flat")
+int    flatMinute = input.int(55, ":", minval = 0, maxval = 59, group = GRP_TIME, inline = "flat",
+     tooltip = "The trade is closed at the close of the first candle that ends at or after this time.")
+
+string entryModel     = input.string(MODEL_MSS, "Entry trigger", options = [MODEL_MSS, MODEL_FVG, MODEL_IFVG, MODEL_BOTH], group = GRP_RULE,
+     tooltip = "FVG after a structure shift: price closes beyond the last swing, then a fair value gap forms in the new direction. First FVG: no structure shift needed. Inverse FVG: a candle closes through the last gap that formed against the trade.")
+int    pivotLen       = input.int(2, "Swing strength (candles each side)", minval = 1, maxval = 10, group = GRP_RULE,
+     tooltip = "A swing high is a high with this many lower highs after it and no higher high in this many candles before it.")
+int    maxBarsAfter   = input.int(20, "Entry must come within (candles after the sweep's extreme)", minval = 1, group = GRP_RULE)
+int    maxSetupBars   = input.int(60, "Setup expires (candles after the level was taken)", minval = 1, group = GRP_RULE)
+int    minSweepTicks  = input.int(1, "Sweep must pass the level by (ticks)", minval = 1, group = GRP_RULE)
+int    minGapTicks    = input.int(1, "Smallest fair value gap (ticks)", minval = 1, group = GRP_RULE)
+int    ifvgLookback   = input.int(30, "Inverse FVG: gap formed within (candles before the extreme)", minval = 1, group = GRP_RULE)
+bool   requireReclaim = input.bool(false, "Entry candle must close back inside the swept level", group = GRP_RULE)
+bool   allowLong      = input.bool(true, "Take buys (after a low is swept)", group = GRP_RULE)
+bool   allowShort     = input.bool(true, "Take sells (after a high is swept)", group = GRP_RULE)
+int    maxTrades      = input.int(2, "Trades per day", minval = 1, maxval = 10, group = GRP_RULE)
+
+int    stopBufTicks = input.int(1, "Stop beyond the sweep's extreme (ticks)", minval = 0, group = GRP_RISK)
+int    minRiskTicks = input.int(2, "Skip if the stop is closer than (ticks)", minval = 1, group = GRP_RISK)
+float  maxRisk      = input.float(0.0, "Skip if the stop is further than (points, 0 = off)", minval = 0.0, group = GRP_RISK)
+string targetMode   = input.string(TGT_RR, "Target", options = [TGT_RR, TGT_LIQ], group = GRP_RISK,
+     tooltip = "Next liquidity level: the nearest unswept session high (for a buy) or low (for a sell) that pays at least the minimum below. If there is none, the fixed reward:risk is used.")
+float  rrInput      = input.float(2.0, "Fixed reward:risk", minval = 0.1, step = 0.25, group = GRP_RISK)
+float  minRR        = input.float(1.0, "Liquidity target must pay at least (reward:risk)", minval = 0.0, step = 0.25, group = GRP_RISK)
+bool   usePrevDay   = input.bool(true, "Previous day's high and low count as liquidity targets", group = GRP_RISK)
+
+string sizeMode = input.string("Fixed quantity", "Size by", options = ["Fixed quantity", "Risk % of equity"], group = GRP_SIZE)
+float  fixedQty = input.float(1.0, "Fixed quantity (contracts / shares / units)", minval = 0.0, step = 0.1, group = GRP_SIZE)
+float  riskPct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, step = 0.25, group = GRP_SIZE,
+     tooltip = "Used when 'Size by' is 'Risk % of equity': the quantity is sized so that a stop-out loses about this much.")
+
+bool showSessions = input.bool(true, "Shade the Asia and London sessions", group = GRP_VIEW)
+bool showLevels   = input.bool(true, "Show session highs and lows until they are swept", group = GRP_VIEW)
+bool showPrevDay  = input.bool(false, "Show the previous day's high and low", group = GRP_VIEW)
+bool showSweeps   = input.bool(true, "Mark each sweep", group = GRP_VIEW)
+bool showSetups   = input.bool(true, "Mark each entry and its gap", group = GRP_VIEW)
+bool showTable    = input.bool(true, "Show the summary table", group = GRP_VIEW)
+bool alertEntries = input.bool(true, "Alert on entries", group = GRP_VIEW)
+bool alertSweeps  = input.bool(false, "Alert on sweeps", group = GRP_VIEW)
+
+bool useFvg  = entryModel == MODEL_MSS or entryModel == MODEL_FVG or entryModel == MODEL_BOTH
+bool useIfvg = entryModel == MODEL_IFVG or entryModel == MODEL_BOTH
+bool needMss = entryModel == MODEL_MSS or entryModel == MODEL_BOTH
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+// Minutes after midnight at the start of a session string such as "2000-0000".
+f_sessionStart(string sess) =>
+    int(str.tonumber(str.substring(sess, 0, 2))) * 60 + int(str.tonumber(str.substring(sess, 2, 4)))
+
+// A price distance in whole ticks, rounded half up.
+f_ticks(float d) =>
+    int(math.floor(d / syminfo.mintick + 0.5 + 0.000000001))
+
+// Order quantity for a trade that risks `riskPoints` a unit.
+f_qty(float riskPoints) =>
+    float q = fixedQty
+    if sizeMode == "Risk % of equity"
+        float riskCash = math.max(strategy.equity, 0.0) * riskPct / 100.0
+        q := riskPoints > 0 ? riskCash / (riskPoints * syminfo.pointvalue) : 0.0
+        if syminfo.type == "futures"
+            q := math.floor(q)
+    q
+
+// True when the candle `n` back is a swing high: every one of the `n` candles after it has a
+// lower high, and none of the `n` candles before it has a higher high.
+f_pivotHigh(int n) =>
+    bool found = bar_index >= 2 * n
+    if found
+        float p = high[n]
+        for k = 0 to n - 1
+            if high[k] >= p
+                found := false
+                break
+    if found
+        float p = high[n]
+        for k = n + 1 to 2 * n
+            if high[k] > p
+                found := false
+                break
+    found
+
+f_pivotLow(int n) =>
+    bool found = bar_index >= 2 * n
+    if found
+        float p = low[n]
+        for k = 0 to n - 1
+            if low[k] <= p
+                found := false
+                break
+    if found
+        float p = low[n]
+        for k = n + 1 to 2 * n
+            if low[k] < p
+                found := false
+                break
+    found
+
+// Index of the most recent stored gap that formed at or before `extBar` and within the lookback, or -1.
+f_findGap(array<int> gapBars, int extBar) =>
+    int found = -1
+    if array.size(gapBars) > 0
+        for k = array.size(gapBars) - 1 to 0
+            int b = array.get(gapBars, k)
+            if b <= extBar and extBar - b <= ifvgLookback
+                found := k
+                break
+    found
+
+// The level when it qualifies as a target (`dir` is 1 for a buy, -1 for a sell), else na.
+f_candidate(bool active, float lvl, float entry, float risk, float dir) =>
+    float dist = active and not na(lvl) ? dir * (lvl - entry) : na
+    not na(dist) and dist > 0 and dist / risk >= minRR ? lvl : na
+
+// ── Clock ────────────────────────────────────────────────────────────────────
+int  barMinutes = math.max(1, int(math.round(timeframe.in_seconds() / 60.0)))
+int  todMin     = hour(time, tzInput) * 60 + minute(time, tzInput)
+int  dayStart   = f_sessionStart(asiaSess)
+int  cycMin     = (todMin - dayStart + 1440) % 1440
+int  shifted    = time + (1440 - dayStart) * 60000
+int  cycleKey   = year(shifted, tzInput) * 10000 + month(shifted, tzInput) * 100 + dayofmonth(shifted, tzInput)
+bool inAsia     = not na(time(timeframe.period, asiaSess, tzInput))
+bool inLondon   = not na(time(timeframe.period, londonSess, tzInput))
+bool inEntry    = not na(time(timeframe.period, entrySess, tzInput))
+int  flatCyc    = (flatHour * 60 + flatMinute - dayStart + 1440) % 1440
+bool flatNow    = useFlat and cycMin + barMinutes >= flatCyc
+
+// ── State ────────────────────────────────────────────────────────────────────
+var int   lastCycleKey = na
+var bool  cycleValid   = false
+var float cycHi        = na
+var float cycLo        = na
+var float pdh          = na
+var float pdl          = na
+var float asiaHi       = na
+var float asiaLo       = na
+var float lonHi        = na
+var float lonLo        = na
+var bool  asiaSeen     = false
+var bool  asiaDone     = false
+var bool  lonSeen      = false
+var bool  lonDone      = false
+var bool  asiaHiSwept  = false
+var bool  asiaLoSwept  = false
+var bool  lonHiSwept   = false
+var bool  lonLoSwept   = false
+var bool  pdhSwept     = false
+var bool  pdlSwept     = false
+var int   tradesToday  = 0
+var float lastPH       = na
+var int   lastPHBar    = na
+var float lastPL       = na
+var int   lastPLBar    = na
+
+// An armed buy setup (a low was swept) and an armed sell setup (a high was swept).
+var bool   bullOn     = false
+var float  bullExt    = na
+var int    bullExtBar = na
+var float  bullLvl    = na
+var string bullNames  = ""
+var float  bullRef    = na
+var int    bullRefBar = na
+var bool   bullMss    = false
+var int    bullArmBar = na
+var bool   bearOn     = false
+var float  bearExt    = na
+var int    bearExtBar = na
+var float  bearLvl    = na
+var string bearNames  = ""
+var float  bearRef    = na
+var int    bearRefBar = na
+var bool   bearMss    = false
+var int    bearArmBar = na
+
+// Recent fair value gaps, kept for the inverse FVG trigger.
+var array<float> bullGapTop = array.new<float>()
+var array<float> bullGapBot = array.new<float>()
+var array<int>   bullGapBar = array.new<int>()
+var array<float> bearGapTop = array.new<float>()
+var array<float> bearGapBot = array.new<float>()
+var array<int>   bearGapBar = array.new<int>()
+
+var float stopLevel   = na
+var float targetLevel = na
+var int   tooSmall    = 0
+
+// ── 1. Trading day rollover (the day starts with the Asia session) ───────────
+if na(lastCycleKey) or cycleKey != lastCycleKey
+    cycleValid   := not na(lastCycleKey)
+    lastCycleKey := cycleKey
+    pdh          := cycHi
+    pdl          := cycLo
+    cycHi        := high
+    cycLo        := low
+    asiaHi       := na
+    asiaLo       := na
+    lonHi        := na
+    lonLo        := na
+    asiaSeen     := false
+    asiaDone     := false
+    lonSeen      := false
+    lonDone      := false
+    asiaHiSwept  := false
+    asiaLoSwept  := false
+    lonHiSwept   := false
+    lonLoSwept   := false
+    pdhSwept     := false
+    pdlSwept     := false
+    tradesToday  := 0
+    bullOn       := false
+    bearOn       := false
+else
+    cycHi := math.max(cycHi, high)
+    cycLo := math.min(cycLo, low)
+
+// ── 2. Swing points ──────────────────────────────────────────────────────────
+bool newPH = f_pivotHigh(pivotLen)
+bool newPL = f_pivotLow(pivotLen)
+if newPH
+    lastPH    := high[pivotLen]
+    lastPHBar := bar_index - pivotLen
+if newPL
+    lastPL    := low[pivotLen]
+    lastPLBar := bar_index - pivotLen
+
+// ── 3. Session highs and lows ────────────────────────────────────────────────
+if inAsia and not asiaDone
+    asiaSeen := true
+    asiaHi   := na(asiaHi) ? high : math.max(asiaHi, high)
+    asiaLo   := na(asiaLo) ? low : math.min(asiaLo, low)
+else if asiaSeen and not asiaDone
+    asiaDone := true
+
+if inLondon and not lonDone
+    lonSeen := true
+    lonHi   := na(lonHi) ? high : math.max(lonHi, high)
+    lonLo   := na(lonLo) ? low : math.min(lonLo, low)
+else if lonSeen and not lonDone
+    lonDone := true
+
+// ── 4. Fair value gaps completed by this candle ──────────────────────────────
+bool bullGap = bar_index >= 2 and f_ticks(low - high[2]) >= minGapTicks
+bool bearGap = bar_index >= 2 and f_ticks(low[2] - high) >= minGapTicks
+
+// ── 5. Sweeps, armed setups and entries ──────────────────────────────────────
+bool   lowSwept    = false
+float  lowLvl      = na
+string lowNames    = ""
+bool   highSwept   = false
+float  highLvl     = na
+string highNames   = ""
+bool   enteredLong = false
+bool   enteredShort = false
+string entryNote   = ""
+float  zoneTop     = na
+float  zoneBot     = na
+int    zoneLeft    = na
+
+if cycleValid
+    // 5a. Which levels did this candle take?
+    if asiaDone and not asiaLoSwept and f_ticks(asiaLo - low) >= minSweepTicks
+        asiaLoSwept := true
+        lowSwept    := true
+        lowLvl      := asiaLo
+        lowNames    := "Asia low"
+    if lonDone and not lonLoSwept and f_ticks(lonLo - low) >= minSweepTicks
+        lonLoSwept := true
+        lowLvl     := lowSwept ? math.min(lowLvl, lonLo) : lonLo
+        lowNames   := lowSwept ? lowNames + " + London low" : "London low"
+        lowSwept   := true
+    if asiaDone and not asiaHiSwept and f_ticks(high - asiaHi) >= minSweepTicks
+        asiaHiSwept := true
+        highSwept   := true
+        highLvl     := asiaHi
+        highNames   := "Asia high"
+    if lonDone and not lonHiSwept and f_ticks(high - lonHi) >= minSweepTicks
+        lonHiSwept := true
+        highLvl    := highSwept ? math.max(highLvl, lonHi) : lonHi
+        highNames  := highSwept ? highNames + " + London high" : "London high"
+        highSwept  := true
+    if not pdlSwept and f_ticks(pdl - low) >= minSweepTicks
+        pdlSwept := true
+    if not pdhSwept and f_ticks(high - pdh) >= minSweepTicks
+        pdhSwept := true
+
+    // 5b. Arm a setup, or add to the one that is already armed.
+    if lowSwept
+        if not bullOn
+            bullOn     := true
+            bullExt    := low
+            bullExtBar := bar_index
+            bullLvl    := lowLvl
+            bullNames  := lowNames
+            bullRef    := lastPH
+            bullRefBar := lastPHBar
+            bullMss    := false
+            bullArmBar := bar_index
+        else
+            bullNames  := bullNames + " + " + lowNames
+            bullLvl    := math.min(bullLvl, lowLvl)
+            bullArmBar := bar_index
+    if highSwept
+        if not bearOn
+            bearOn     := true
+            bearExt    := high
+            bearExtBar := bar_index
+            bearLvl    := highLvl
+            bearNames  := highNames
+            bearRef    := lastPL
+            bearRefBar := lastPLBar
+            bearMss    := false
+            bearArmBar := bar_index
+        else
+            bearNames  := bearNames + " + " + highNames
+            bearLvl    := math.max(bearLvl, highLvl)
+            bearArmBar := bar_index
+
+    // 5c. Keep the armed setups current: new extreme, swing reference, structure shift, expiry.
+    if bullOn
+        if low < bullExt
+            bullExt    := low
+            bullExtBar := bar_index
+            bullMss    := false
+            bullRef    := lastPH
+            bullRefBar := lastPHBar
+        if newPH and lastPHBar < bullExtBar and (na(bullRefBar) or lastPHBar > bullRefBar)
+            bullRef    := lastPH
+            bullRefBar := lastPHBar
+        if not na(bullRef) and close > bullRef
+            bullMss := true
+        if bar_index - bullExtBar > maxBarsAfter or bar_index - bullArmBar > maxSetupBars
+            bullOn := false
+    if bearOn
+        if high > bearExt
+            bearExt    := high
+            bearExtBar := bar_index
+            bearMss    := false
+            bearRef    := lastPL
+            bearRefBar := lastPLBar
+        if newPL and lastPLBar < bearExtBar and (na(bearRefBar) or lastPLBar > bearRefBar)
+            bearRef    := lastPL
+            bearRefBar := lastPLBar
+        if not na(bearRef) and close < bearRef
+            bearMss := true
+        if bar_index - bearExtBar > maxBarsAfter or bar_index - bearArmBar > maxSetupBars
+            bearOn := false
+
+    // 5d. Entries, at the close of the candle that completes the trigger.
+    bool canEnter = barstate.isconfirmed and strategy.position_size == 0 and inEntry and not flatNow and tradesToday < maxTrades
+
+    if bullOn and canEnter and allowLong
+        int   g       = f_findGap(bearGapBar, bullExtBar)
+        bool  sigFvg  = useFvg and bullGap and (bullMss or not needMss)
+        bool  sigIfvg = false
+        if useIfvg and g >= 0
+            sigIfvg := close > array.get(bearGapTop, g)
+        if (sigFvg or sigIfvg) and (close > bullLvl or not requireReclaim)
+            canEnter := false
+            float stopPx  = math.round_to_mintick(bullExt - stopBufTicks * syminfo.mintick)
+            float riskPts = close - stopPx
+            string swept  = bullNames
+            bullOn := false
+            if f_ticks(riskPts) >= minRiskTicks and (maxRisk <= 0 or riskPts <= maxRisk)
+                float  tgt     = math.round_to_mintick(close + rrInput * riskPts)
+                string tgtName = str.tostring(rrInput) + "R"
+                if targetMode == TGT_LIQ
+                    float c1 = f_candidate(asiaDone and not asiaHiSwept, asiaHi, close, riskPts, 1.0)
+                    float c2 = f_candidate(lonDone and not lonHiSwept, lonHi, close, riskPts, 1.0)
+                    float c3 = f_candidate(usePrevDay and not pdhSwept, pdh, close, riskPts, 1.0)
+                    float best = na
+                    string bestName = ""
+                    if not na(c1)
+                        best     := c1
+                        bestName := "Asia high"
+                    if not na(c2) and (na(best) or c2 < best)
+                        best     := c2
+                        bestName := "London high"
+                    if not na(c3) and (na(best) or c3 < best)
+                        best     := c3
+                        bestName := "previous day high"
+                    if not na(best)
+                        tgt     := math.round_to_mintick(best)
+                        tgtName := bestName
+                float qty = f_qty(riskPts)
+                if qty > 0
+                    strategy.entry("Long", strategy.long, qty = qty)
+                    strategy.exit("Long exit", from_entry = "Long", stop = stopPx, limit = tgt,
+                         comment_profit = "target", comment_loss = "stop")
+                    tradesToday += 1
+                    stopLevel   := stopPx
+                    targetLevel := tgt
+                    enteredLong := true
+                    if sigFvg
+                        zoneTop  := low
+                        zoneBot  := high[2]
+                        zoneLeft := bar_index - 2
+                    else
+                        zoneTop  := array.get(bearGapTop, g)
+                        zoneBot  := array.get(bearGapBot, g)
+                        zoneLeft := array.get(bearGapBar, g) - 2
+                    entryNote   := "BUY " + syminfo.ticker + " at " + str.tostring(close, format.mintick) + " | stop " + str.tostring(stopPx, format.mintick) + " | target " + str.tostring(tgt, format.mintick) + " (" + tgtName + ") | swept " + swept + " | trigger " + (sigFvg ? "FVG" : "inverse FVG")
+                else
+                    tooSmall += 1
+
+    if bearOn and canEnter and allowShort
+        int   g       = f_findGap(bullGapBar, bearExtBar)
+        bool  sigFvg  = useFvg and bearGap and (bearMss or not needMss)
+        bool  sigIfvg = false
+        if useIfvg and g >= 0
+            sigIfvg := close < array.get(bullGapBot, g)
+        if (sigFvg or sigIfvg) and (close < bearLvl or not requireReclaim)
+            canEnter := false
+            float stopPx  = math.round_to_mintick(bearExt + stopBufTicks * syminfo.mintick)
+            float riskPts = stopPx - close
+            string swept  = bearNames
+            bearOn := false
+            if f_ticks(riskPts) >= minRiskTicks and (maxRisk <= 0 or riskPts <= maxRisk)
+                float  tgt     = math.round_to_mintick(close - rrInput * riskPts)
+                string tgtName = str.tostring(rrInput) + "R"
+                if targetMode == TGT_LIQ
+                    float c1 = f_candidate(asiaDone and not asiaLoSwept, asiaLo, close, riskPts, -1.0)
+                    float c2 = f_candidate(lonDone and not lonLoSwept, lonLo, close, riskPts, -1.0)
+                    float c3 = f_candidate(usePrevDay and not pdlSwept, pdl, close, riskPts, -1.0)
+                    float best = na
+                    string bestName = ""
+                    if not na(c1)
+                        best     := c1
+                        bestName := "Asia low"
+                    if not na(c2) and (na(best) or c2 > best)
+                        best     := c2
+                        bestName := "London low"
+                    if not na(c3) and (na(best) or c3 > best)
+                        best     := c3
+                        bestName := "previous day low"
+                    if not na(best)
+                        tgt     := math.round_to_mintick(best)
+                        tgtName := bestName
+                float qty = f_qty(riskPts)
+                if qty > 0
+                    strategy.entry("Short", strategy.short, qty = qty)
+                    strategy.exit("Short exit", from_entry = "Short", stop = stopPx, limit = tgt,
+                         comment_profit = "target", comment_loss = "stop")
+                    tradesToday  += 1
+                    stopLevel    := stopPx
+                    targetLevel  := tgt
+                    enteredShort := true
+                    if sigFvg
+                        zoneTop  := low[2]
+                        zoneBot  := high
+                        zoneLeft := bar_index - 2
+                    else
+                        zoneTop  := array.get(bullGapTop, g)
+                        zoneBot  := array.get(bullGapBot, g)
+                        zoneLeft := array.get(bullGapBar, g) - 2
+                    entryNote    := "SELL " + syminfo.ticker + " at " + str.tostring(close, format.mintick) + " | stop " + str.tostring(stopPx, format.mintick) + " | target " + str.tostring(tgt, format.mintick) + " (" + tgtName + ") | swept " + swept + " | trigger " + (sigFvg ? "FVG" : "inverse FVG")
+                else
+                    tooSmall += 1
+
+// ── 6. Gap book-keeping: a gap is used up once price closes through it ───────
+if array.size(bearGapBar) > 0
+    for k = array.size(bearGapBar) - 1 to 0
+        if close > array.get(bearGapTop, k) or bar_index - array.get(bearGapBar, k) > ifvgLookback + maxBarsAfter
+            array.remove(bearGapTop, k)
+            array.remove(bearGapBot, k)
+            array.remove(bearGapBar, k)
+if array.size(bullGapBar) > 0
+    for k = array.size(bullGapBar) - 1 to 0
+        if close < array.get(bullGapBot, k) or bar_index - array.get(bullGapBar, k) > ifvgLookback + maxBarsAfter
+            array.remove(bullGapTop, k)
+            array.remove(bullGapBot, k)
+            array.remove(bullGapBar, k)
+if bullGap
+    array.push(bullGapTop, low)
+    array.push(bullGapBot, high[2])
+    array.push(bullGapBar, bar_index)
+if bearGap
+    array.push(bearGapTop, low[2])
+    array.push(bearGapBot, high)
+    array.push(bearGapBar, bar_index)
+if array.size(bullGapBar) > 12
+    array.shift(bullGapTop)
+    array.shift(bullGapBot)
+    array.shift(bullGapBar)
+if array.size(bearGapBar) > 12
+    array.shift(bearGapTop)
+    array.shift(bearGapBot)
+    array.shift(bearGapBar)
+
+// ── 7. Flat by the close-out time ────────────────────────────────────────────
+bool entered = enteredLong or enteredShort
+if barstate.isconfirmed and flatNow and strategy.position_size != 0
+    strategy.close_all(comment = "flat by time")
+
+if strategy.position_size == 0 and not entered
+    stopLevel   := na
+    targetLevel := na
+
+// ── 8. Drawing and alerts ────────────────────────────────────────────────────
+if entered
+    if showSetups
+        box.new(zoneLeft, zoneTop, bar_index + 10, zoneBot,
+             border_color = enteredLong ? color.new(color.teal, 40) : color.new(color.maroon, 40),
+             bgcolor = enteredLong ? color.new(color.teal, 82) : color.new(color.maroon, 82))
+        label.new(bar_index, enteredLong ? low : high,
+             text = (enteredLong ? "BUY " : "SELL ") + str.tostring(close, format.mintick) + "\nstop " + str.tostring(stopLevel, format.mintick) + "\ntarget " + str.tostring(targetLevel, format.mintick),
+             style = enteredLong ? label.style_label_up : label.style_label_down,
+             color = enteredLong ? color.new(color.teal, 10) : color.new(color.maroon, 10),
+             textcolor = color.white, size = size.small)
+    if alertEntries
+        alert("Sweep FVG " + entryNote, alert.freq_once_per_bar_close)
+
+if barstate.isconfirmed and (lowSwept or highSwept)
+    if showSweeps and lowSwept
+        label.new(bar_index, low, text = lowNames + " swept", style = label.style_label_up,
+             color = color.new(color.gray, 35), textcolor = color.white, size = size.tiny)
+    if showSweeps and highSwept
+        label.new(bar_index, high, text = highNames + " swept", style = label.style_label_down,
+             color = color.new(color.gray, 35), textcolor = color.white, size = size.tiny)
+    if alertSweeps
+        alert("Sweep FVG: " + (lowSwept ? lowNames : "") + (lowSwept and highSwept ? " and " : "") + (highSwept ? highNames : "") + " swept on " + syminfo.ticker + " at " + str.tostring(close, format.mintick),
+             alert.freq_once_per_bar_close)
+
+bool levelsOn = showLevels and cycleValid and not flatNow
+plot(levelsOn and asiaDone and not asiaHiSwept ? asiaHi : na, "Asia high", color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
+plot(levelsOn and asiaDone and not asiaLoSwept ? asiaLo : na, "Asia low", color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
+plot(levelsOn and lonDone and not lonHiSwept ? lonHi : na, "London high", color = color.new(color.blue, 0), linewidth = 1, style = plot.style_linebr)
+plot(levelsOn and lonDone and not lonLoSwept ? lonLo : na, "London low", color = color.new(color.blue, 0), linewidth = 1, style = plot.style_linebr)
+plot(showPrevDay and cycleValid and not pdhSwept ? pdh : na, "Previous day high", color = color.new(color.gray, 20), linewidth = 1, style = plot.style_linebr)
+plot(showPrevDay and cycleValid and not pdlSwept ? pdl : na, "Previous day low", color = color.new(color.gray, 20), linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? stopLevel : na, "Stop", color = color.new(color.red, 0), linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? targetLevel : na, "Target", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+bgcolor(showSessions and inAsia ? color.new(color.orange, 92) : na, title = "Asia session")
+bgcolor(showSessions and inLondon ? color.new(color.blue, 92) : na, title = "London session")
+
+// ── 9. Summary table ─────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 72),
+     border_width = 1, border_color = color.new(color.gray, 60))
+
+f_row(int row, string name, string value, color valueColor) =>
+    table.cell(info, 0, row, name, text_color = color.new(color.white, 20), text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 1, row, value, text_color = valueColor, text_size = size.small, text_halign = text.align_left)
+
+f_levelText(float lvl, bool done, bool swept) =>
+    na(lvl) ? "none" : str.tostring(lvl, format.mintick) + (swept ? " (swept)" : done ? "" : " (forming)")
+
+if showTable and barstate.islast
+    string status = "Waiting for a sweep"
+    if not cycleValid
+        status := "Warming up: first day on the chart"
+    else if strategy.position_size != 0
+        status := strategy.position_size > 0 ? "In a buy" : "In a sell"
+    else if tradesToday >= maxTrades
+        status := "Done for today"
+    else if flatNow
+        status := "Past the close-out time"
+    else if bullOn
+        status := bullNames + " swept: waiting for a buy trigger"
+    else if bearOn
+        status := bearNames + " swept: waiting for a sell trigger"
+    else if not asiaDone or not lonDone
+        status := "Sessions still forming"
+    if cycleValid and strategy.position_size == 0 and tradesToday < maxTrades and not flatNow and not inEntry
+        status := status + " (outside the entry window)"
+    string hint = ""
+    if cycleValid and not asiaSeen and not lonSeen and cycMin > 720
+        hint := "No Asia or London candles on this symbol. Use a market that trades overnight (futures, FX, crypto)."
+    else if not (timeframe.isminutes and timeframe.multiplier == 1)
+        hint := "Built for the 1-minute chart."
+    else if tooSmall > 0 and sizeMode == "Risk % of equity"
+        hint := str.tostring(tooSmall) + " trade(s) skipped: risk % too small for 1 unit."
+    f_row(0, "Session Sweep + FVG", syminfo.ticker, color.white)
+    f_row(1, "Asia high", f_levelText(asiaHi, asiaDone, asiaHiSwept), color.orange)
+    f_row(2, "Asia low", f_levelText(asiaLo, asiaDone, asiaLoSwept), color.orange)
+    f_row(3, "London high", f_levelText(lonHi, lonDone, lonHiSwept), color.aqua)
+    f_row(4, "London low", f_levelText(lonLo, lonDone, lonLoSwept), color.aqua)
+    f_row(5, "Status", hint == "" ? status : status + "\n" + hint, color.white)

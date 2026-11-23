@@ -1,0 +1,215 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+// 10 AM Range Breakout                        Built for the 15-minute chart.
+//
+// The rule, exactly as it was described:
+//   1. Wait until 10:00 a.m. New York time. Mark the high and the low of the
+//      first two 15-minute candles of the session (9:30 and 9:45).
+//   2. A candle that CLOSES above the range is a buy. A candle that CLOSES
+//      below the range is a sell. A wick outside the range is nothing.
+//   3. The stop goes at the opposite end of the range.
+//   4. The take profit is a fixed number of points (10 by default).
+//
+// What this script adds so the rule can be tested honestly:
+//   - one trade a day by default, no new entries late in the day, flat by 15:55
+//   - a table that shows today's reward against today's risk and the win rate
+//     that pairing needs just to break even
+//
+// Everything is decided on closed candles, so nothing repaints.
+// This is a tool for testing a rule. It is not financial advice.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("10 AM Range Breakout", shorttitle = "10AM Range", overlay = true,
+     initial_capital = 10000, default_qty_type = strategy.fixed, default_qty_value = 1,
+     pyramiding = 0, process_orders_on_close = true, calc_on_every_tick = false,
+     margin_long = 0, margin_short = 0, max_labels_count = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+string GRP_TIME = "Time"
+string GRP_RULE = "Rules"
+string GRP_SIZE = "Order size (Strategy Tester only)"
+string GRP_VIEW = "Display and alerts"
+
+string tzInput    = input.string("America/New_York", "Time zone", group = GRP_TIME,
+     tooltip = "All times below are read in this time zone. America/New_York follows US daylight saving time automatically.")
+string rangeSess  = input.session("0930-1000", "Range window", group = GRP_TIME,
+     tooltip = "Candles that open inside this window build the range. 09:30-10:00 is the first two 15-minute candles of the New York session. For the first two candles AFTER 10:00, use 10:00-10:30.")
+string entrySess  = input.session("1000-1530", "Entry window", group = GRP_TIME,
+     tooltip = "A breakout candle must open inside this window to count.")
+bool   useFlat    = input.bool(true, "Close any open trade at", group = GRP_TIME, inline = "flat")
+int    flatHour   = input.int(15, "", minval = 0, maxval = 23, group = GRP_TIME, inline = "flat")
+int    flatMinute = input.int(55, ":", minval = 0, maxval = 59, group = GRP_TIME, inline = "flat",
+     tooltip = "The trade is closed at the close of the first candle that ends at or after this time.")
+
+float  tpPoints     = input.float(10.0, "Take profit (points)", minval = 0.0, step = 0.5, group = GRP_RULE,
+     tooltip = "Price units on this chart: 10 means 10.00 on the price scale. Set it to match your market. 0 = no take profit (exit at the stop or at the close-out time).")
+int    stopBufTicks = input.int(0, "Stop buffer beyond the range (ticks)", minval = 0, group = GRP_RULE)
+bool   allowLong    = input.bool(true, "Take buys (close above the range)", group = GRP_RULE)
+bool   allowShort   = input.bool(true, "Take sells (close below the range)", group = GRP_RULE)
+int    maxTrades    = input.int(1, "Trades per day", minval = 1, maxval = 5, group = GRP_RULE)
+float  maxRange     = input.float(0.0, "Skip the day if the range is wider than (points, 0 = off)", minval = 0.0, group = GRP_RULE)
+float  minRR        = input.float(0.0, "Skip the trade if reward:risk is under (0 = off)", minval = 0.0, step = 0.1, group = GRP_RULE,
+     tooltip = "Reward:risk here is the take profit divided by the distance from the entry to the stop.")
+
+string sizeMode = input.string("Fixed quantity", "Size by", options = ["Fixed quantity", "Risk % of equity"], group = GRP_SIZE)
+float  fixedQty = input.float(1.0, "Fixed quantity (contracts / shares / units)", minval = 0.0, step = 0.1, group = GRP_SIZE)
+float  riskPct  = input.float(1.0, "Risk per trade (% of equity)", minval = 0.01, step = 0.25, group = GRP_SIZE,
+     tooltip = "Used when 'Size by' is 'Risk % of equity': the quantity is sized so that a stop-out loses about this much.")
+
+bool showRange    = input.bool(true, "Shade the range window", group = GRP_VIEW)
+bool showLevels   = input.bool(true, "Show the range high and low", group = GRP_VIEW)
+bool showLabels   = input.bool(true, "Label each entry", group = GRP_VIEW)
+bool showTable    = input.bool(true, "Show the summary table", group = GRP_VIEW)
+bool alertEntries = input.bool(true, "Alert on entries", group = GRP_VIEW)
+bool alertRange   = input.bool(false, "Alert when the range is set", group = GRP_VIEW)
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+// Minutes after midnight at the start of a session string such as "0930-1000".
+f_sessionStart(string sess) =>
+    int(str.tonumber(str.substring(sess, 0, 2))) * 60 + int(str.tonumber(str.substring(sess, 2, 4)))
+
+// Order quantity for a trade that risks `riskPoints` a unit.
+f_qty(float riskPoints) =>
+    float q = fixedQty
+    if sizeMode == "Risk % of equity"
+        float riskCash = math.max(strategy.equity, 0.0) * riskPct / 100.0
+        q := riskPoints > 0 ? riskCash / (riskPoints * syminfo.pointvalue) : 0.0
+        if syminfo.type == "futures"
+            q := math.floor(q)
+    q
+
+// ── Clock ────────────────────────────────────────────────────────────────────
+int  barMinutes = math.max(1, int(math.round(timeframe.in_seconds() / 60.0)))
+int  todMin     = hour(time, tzInput) * 60 + minute(time, tzInput)
+int  dayKey     = year(time, tzInput) * 10000 + month(time, tzInput) * 100 + dayofmonth(time, tzInput)
+bool inRange    = not na(time(timeframe.period, rangeSess, tzInput))
+bool inEntry    = not na(time(timeframe.period, entrySess, tzInput))
+int  rangeStart = f_sessionStart(rangeSess)
+bool flatNow    = useFlat and todMin + barMinutes >= flatHour * 60 + flatMinute
+
+// ── State (one set per day) ──────────────────────────────────────────────────
+var int   lastDayKey  = na
+var float rHigh       = na
+var float rLow        = na
+var int   rBars       = 0
+var bool  rClean      = false
+var bool  rDone       = false
+var bool  daySkipped  = false
+var int   tradesToday = 0
+var float stopLevel   = na
+var float targetLevel = na
+var int   tooSmall    = 0
+
+if na(lastDayKey) or dayKey != lastDayKey
+    lastDayKey  := dayKey
+    rHigh       := na
+    rLow        := na
+    rBars       := 0
+    rClean      := false
+    rDone       := false
+    daySkipped  := false
+    tradesToday := 0
+
+// ── Build the range ──────────────────────────────────────────────────────────
+bool rangeJustSet = false
+if inRange and not rDone
+    if rBars == 0
+        rClean := todMin == rangeStart
+    rBars += 1
+    rHigh := na(rHigh) ? high : math.max(rHigh, high)
+    rLow  := na(rLow) ? low : math.min(rLow, low)
+else if rBars > 0 and not rDone
+    rDone := true
+    rangeJustSet := true
+    if not rClean
+        daySkipped := true
+    else if maxRange > 0 and rHigh - rLow > maxRange
+        daySkipped := true
+
+// ── Entries ──────────────────────────────────────────────────────────────────
+bool canTrade    = barstate.isconfirmed and rDone and not daySkipped and not inRange and inEntry and not flatNow and tradesToday < maxTrades and strategy.position_size == 0
+bool longSignal  = canTrade and allowLong and close > rHigh
+bool shortSignal = canTrade and allowShort and close < rLow
+bool entered     = false
+
+if longSignal or shortSignal
+    bool   isLong  = longSignal
+    float  stopPx  = isLong ? rLow - stopBufTicks * syminfo.mintick : rHigh + stopBufTicks * syminfo.mintick
+    float  riskPts = math.abs(close - stopPx)
+    float  tpPx    = tpPoints > 0 ? math.round_to_mintick(isLong ? close + tpPoints : close - tpPoints) : na
+    float  rr      = riskPts > 0 and tpPoints > 0 ? tpPoints / riskPts : na
+    tradesToday += 1
+    if riskPts > 0 and (minRR <= 0 or (not na(rr) and rr >= minRR))
+        float qty = f_qty(riskPts)
+        if qty > 0
+            string id = isLong ? "Long" : "Short"
+            strategy.entry(id, isLong ? strategy.long : strategy.short, qty = qty)
+            strategy.exit(id + " exit", from_entry = id, stop = stopPx, limit = tpPx,
+                 comment_profit = "target", comment_loss = "stop")
+            stopLevel   := stopPx
+            targetLevel := tpPx
+            entered     := true
+            string tpText = na(tpPx) ? "none" : str.tostring(tpPx, format.mintick)
+            string rrText = na(rr) ? "" : " | reward:risk " + str.tostring(rr, "#.##")
+            if showLabels
+                label.new(bar_index, isLong ? low : high,
+                     text = (isLong ? "BUY " : "SELL ") + str.tostring(close, format.mintick) + "\nstop " + str.tostring(stopPx, format.mintick) + "\ntarget " + tpText + (na(rr) ? "" : "\nreward:risk " + str.tostring(rr, "#.##")),
+                     style = isLong ? label.style_label_up : label.style_label_down,
+                     color = isLong ? color.new(color.teal, 10) : color.new(color.maroon, 10),
+                     textcolor = color.white, size = size.small)
+            if alertEntries
+                alert("10AM Range " + (isLong ? "BUY " : "SELL ") + syminfo.ticker + " at " + str.tostring(close, format.mintick) + " | stop " + str.tostring(stopPx, format.mintick) + " | target " + tpText + " | range " + str.tostring(rLow, format.mintick) + " to " + str.tostring(rHigh, format.mintick) + rrText,
+                     alert.freq_once_per_bar_close)
+        else
+            tooSmall += 1
+
+// ── Flat by the close-out time ───────────────────────────────────────────────
+if barstate.isconfirmed and flatNow and strategy.position_size != 0
+    strategy.close_all(comment = "flat by time")
+
+if strategy.position_size == 0 and not entered
+    stopLevel   := na
+    targetLevel := na
+
+if alertRange and rangeJustSet and not daySkipped and barstate.isconfirmed
+    alert("10AM Range set on " + syminfo.ticker + ": high " + str.tostring(rHigh, format.mintick) + ", low " + str.tostring(rLow, format.mintick) + ", width " + str.tostring(rHigh - rLow, format.mintick),
+         alert.freq_once_per_bar_close)
+
+// ── Drawing ──────────────────────────────────────────────────────────────────
+bool liveRange = showLevels and rDone and not daySkipped and not flatNow
+plot(liveRange ? rHigh : na, "Range high", color = color.new(color.teal, 0), linewidth = 2, style = plot.style_linebr)
+plot(liveRange ? rLow : na, "Range low", color = color.new(color.maroon, 0), linewidth = 2, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? stopLevel : na, "Stop", color = color.new(color.red, 0), linewidth = 1, style = plot.style_linebr)
+plot(strategy.position_size != 0 ? targetLevel : na, "Target", color = color.new(color.green, 0), linewidth = 1, style = plot.style_linebr)
+bgcolor(showRange and inRange ? color.new(color.blue, 88) : na, title = "Range window")
+
+// ── Summary table ────────────────────────────────────────────────────────────
+var table info = table.new(position.top_right, 2, 6, bgcolor = color.new(color.black, 72),
+     border_width = 1, border_color = color.new(color.gray, 60))
+
+f_row(int row, string name, string value, color valueColor) =>
+    table.cell(info, 0, row, name, text_color = color.new(color.white, 20), text_size = size.small, text_halign = text.align_left)
+    table.cell(info, 1, row, value, text_color = valueColor, text_size = size.small, text_halign = text.align_left)
+
+if showTable and barstate.islast
+    bool   haveRange = rDone and not na(rHigh) and not na(rLow)
+    float  width     = haveRange ? rHigh - rLow + stopBufTicks * syminfo.mintick : na
+    float  rrEdge    = haveRange and width > 0 and tpPoints > 0 ? tpPoints / width : na
+    string status    = "Waiting for the range window"
+    if daySkipped
+        status := rClean ? "Skipped today: range too wide" : "Skipped today: range incomplete"
+    else if strategy.position_size != 0
+        status := strategy.position_size > 0 ? "In a buy" : "In a sell"
+    else if rDone and tradesToday >= maxTrades
+        status := "Done for today"
+    else if rDone and flatNow
+        status := "Past the close-out time"
+    else if rDone
+        status := "Waiting for a close outside the range"
+    else if rBars > 0
+        status := "Range is forming"
+    f_row(0, "10 AM Range", syminfo.ticker, color.white)
+    f_row(1, "Today's range", haveRange ? str.tostring(rLow, format.mintick) + " to " + str.tostring(rHigh, format.mintick) : "not set yet", color.white)
+    f_row(2, "Target vs stop", na(rrEdge) ? "n/a" : str.tostring(tpPoints) + " vs at least " + str.tostring(width, format.mintick) + " points", color.white)
+    f_row(3, "Reward : risk", na(rrEdge) ? "n/a" : "at best " + str.tostring(rrEdge, "#.##") + " : 1", na(rrEdge) ? color.white : rrEdge < 1 ? color.orange : color.lime)
+    f_row(4, "Win rate to break even", na(rrEdge) ? "n/a" : "at least " + str.tostring(100.0 / (1.0 + rrEdge), "#.#") + "%", na(rrEdge) ? color.white : rrEdge < 1 ? color.orange : color.lime)
+    f_row(5, "Status", tooSmall > 0 and sizeMode == "Risk % of equity" ? status + " (" + str.tostring(tooSmall) + " skipped: risk % too small for 1 unit)" : timeframe.isminutes and timeframe.multiplier == 15 ? status : status + " (built for the 15-minute chart)", color.white)
